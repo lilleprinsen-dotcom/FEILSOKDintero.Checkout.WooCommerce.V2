@@ -219,8 +219,33 @@ function dintero_process_require_authentication( $order, $transaction_id, $pendi
 }
 
 function dintero_process_authorized_order( $order, $settings, $transaction_id ) {
-	// If the order was already processed, we don't need to do anything.
+	$order_id              = $order->get_id();
+	$initial_done_meta_key = '_dintero_initial_confirmation_done';
+	$initial_lock_meta_key = '_dintero_initial_confirmation_lock';
+
+	if ( ! empty( $order->get_meta( $initial_done_meta_key ) ) ) {
+		Dintero_Checkout_Logger::log( sprintf( 'CONFIRMATION: completion already done. Duplicate prevented for WC order id: %s (transaction ID: %s).', $order_id, $transaction_id ) );
+		return;
+	}
+
+	$lock_acquired = add_post_meta( $order_id, $initial_lock_meta_key, $transaction_id, true );
+	if ( ! $lock_acquired ) {
+		Dintero_Checkout_Logger::log( sprintf( 'CONFIRMATION: lock already exists. Duplicate prevented for WC order id: %s (transaction ID: %s).', $order_id, $transaction_id ) );
+		return;
+	}
+
+	Dintero_Checkout_Logger::log( sprintf( 'CONFIRMATION: lock acquired for WC order id: %s (transaction ID: %s).', $order_id, $transaction_id ) );
+
+	// Get the latest order state after lock acquisition to avoid stale in-memory values.
+	$order = wc_get_order( $order_id );
+
+	// If the order was already processed before introducing the marker, register completion and exit.
 	if ( ! empty( $order->get_date_paid() ) ) {
+		$order->update_meta_data( $initial_done_meta_key, time() );
+		$order->update_meta_data( '_dintero_confirmed_txn_' . sanitize_key( $transaction_id ), time() );
+		$order->save_meta_data();
+
+		Dintero_Checkout_Logger::log( sprintf( 'CONFIRMATION: completion done for WC order id: %s (transaction ID: %s). Order was already paid.', $order_id, $transaction_id ) );
 		return;
 	}
 
@@ -240,12 +265,19 @@ function dintero_process_authorized_order( $order, $settings, $transaction_id ) 
 		if ( ! $order->get_date_paid( 'edit' ) ) {
 			$order->set_date_paid( time() );
 		}
+		$order->update_meta_data( $initial_done_meta_key, time() );
+		$order->update_meta_data( '_dintero_confirmed_txn_' . sanitize_key( $transaction_id ), time() );
 		// Save the order to store any changes made to the order.
 		$order->save();
 	} else {
 		// If the status is processing, we can use the built-in payment_complete function to set the status and date paid. This will also save the order.
 		$order->payment_complete( $transaction_id );
+		$order->update_meta_data( $initial_done_meta_key, time() );
+		$order->update_meta_data( '_dintero_confirmed_txn_' . sanitize_key( $transaction_id ), time() );
+		$order->save_meta_data();
 	}
+
+	Dintero_Checkout_Logger::log( sprintf( 'CONFIRMATION: completion done for WC order id: %s (transaction ID: %s).', $order_id, $transaction_id ) );
 }
 
 /**
