@@ -70,9 +70,23 @@ class Dintero_Checkout_Callback {
 	 * @return boolean True if the action was successfully scheduled or already scheduled, false if it failed to schedule.
 	 */
 	public function maybe_schedule_callback( $transaction_id, $merchant_reference, $error ) {
+		$callback_signature = sanitize_key( strtolower( $merchant_reference . '_' . $transaction_id ) );
+		$group              = 'dintero_callback_' . $callback_signature;
+		$action_args        = array(
+			'transaction_id'     => $transaction_id,
+			'merchant_reference' => $merchant_reference,
+			'error'              => $error,
+		);
+
+		if ( false !== as_has_scheduled_action( 'dintero_scheduled_callback', $action_args, $group ) ) {
+			Dintero_Checkout_Logger::log( "CALLBACK [action_scheduler]: The merchant reference $merchant_reference and transaction id $transaction_id has already been scheduled for processing." );
+			return true;
+		}
+
 		$as_args           = array(
 			'hook'   => 'dintero_scheduled_callback',
 			'status' => ActionScheduler_Store::STATUS_PENDING,
+			'group'  => $group,
 		);
 		$scheduled_actions = as_get_scheduled_actions( $as_args, OBJECT );
 
@@ -83,7 +97,7 @@ class Dintero_Checkout_Callback {
 		 */
 		foreach ( $scheduled_actions as $action ) {
 			$action_args = $action->get_args();
-			if ( $merchant_reference === $action_args['merchant_reference'] && $transaction_id === $action_args['transaction_id'] ) {
+			if ( $merchant_reference === ( $action_args['merchant_reference'] ?? '' ) && $transaction_id === ( $action_args['transaction_id'] ?? '' ) ) {
 				Dintero_Checkout_Logger::log( "CALLBACK [action_scheduler]: The merchant reference $merchant_reference and transaction id $transaction_id has already been scheduled for processing." );
 				return true;
 			}
@@ -93,11 +107,9 @@ class Dintero_Checkout_Callback {
 		$scheduled_action = as_schedule_single_action(
 			time() + 60, // 1 Minute in the future.
 			'dintero_scheduled_callback',
-			array(
-				'transaction_id'     => $transaction_id,
-				'merchant_reference' => $merchant_reference,
-				'error'              => $error,
-			)
+			$action_args,
+			$group,
+			true
 		);
 
 		if ( empty( $scheduled_action ) ) {
