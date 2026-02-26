@@ -249,6 +249,155 @@ function dintero_process_authorized_order( $order, $settings, $transaction_id ) 
 }
 
 /**
+ * Get the lock key used to ensure first-time confirmation is idempotent.
+ *
+ * @return string
+ */
+function dintero_get_initial_confirmation_lock_key() {
+	return '_dintero_initial_confirmation_lock';
+}
+
+/**
+ * Get the configured lock stale threshold for initial confirmation lock takeover.
+ *
+ * @return int
+ */
+function dintero_get_initial_confirmation_lock_ttl() {
+	$default_ttl = 5 * MINUTE_IN_SECONDS;
+
+	return (int) apply_filters( 'dintero_initial_confirmation_lock_stale_threshold', $default_ttl );
+}
+
+/**
+ * Build completion marker meta key for a transaction.
+ *
+ * @param string $transaction_id The Dintero transaction id.
+ * @return string
+ */
+function dintero_get_confirmed_txn_marker_key( $transaction_id ) {
+	$sanitized_transaction_id = sanitize_key( strtolower( (string) $transaction_id ) );
+	if ( empty( $sanitized_transaction_id ) ) {
+		$sanitized_transaction_id = md5( (string) $transaction_id );
+	}
+
+	return '_dintero_confirmed_txn_' . $sanitized_transaction_id;
+}
+
+/**
+ * Persist completion markers for initial confirmation.
+ *
+ * @param WC_Order $order The WooCommerce order.
+ * @param string   $transaction_id The Dintero transaction id.
+ * @return void
+ */
+function dintero_mark_initial_confirmation_done( $order, $transaction_id ) {
+	$order->update_meta_data( '_dintero_initial_confirmation_done', gmdate( 'c' ) );
+	$order->update_meta_data( dintero_get_confirmed_txn_marker_key( $transaction_id ), gmdate( 'c' ) );
+	$order->save_meta_data();
+}
+
+/**
+ * Backfill completion marker for already paid orders.
+ *
+ * @param WC_Order $order The WooCommerce order.
+ * @param string   $transaction_id The Dintero transaction id.
+ * @return void
+ */
+function dintero_backfill_initial_confirmation_done_if_paid( $order, $transaction_id ) {
+	if ( ! $order->is_paid() && empty( $order->get_date_paid() ) ) {
+		return;
+	}
+
+	if ( ! empty( $order->get_meta( '_dintero_initial_confirmation_done' ) ) && ! empty( $order->get_meta( dintero_get_confirmed_txn_marker_key( $transaction_id ) ) ) ) {
+		return;
+	}
+
+	dintero_mark_initial_confirmation_done( $order, $transaction_id );
+	Dintero_Checkout_Logger::log( wp_json_encode( array( 'event' => 'confirmation_skip_already_paid_marker_backfill', 'order_id' => $order->get_id(), 'transaction_id' => $transaction_id ) ) );
+}
+
+/**
+ * Check whether initial confirmation is already complete.
+ *
+ * @param WC_Order $order The WooCommerce order.
+ * @param string   $transaction_id The Dintero transaction id.
+ * @return bool
+ */
+function dintero_is_initial_confirmation_done( $order, $transaction_id ) {
+	if ( ! empty( $order->get_meta( '_dintero_initial_confirmation_done' ) ) ) {
+		return true;
+	}
+
+	if ( ! empty( $order->get_meta( dintero_get_confirmed_txn_marker_key( $transaction_id ) ) ) ) {
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * Acquire initial confirmation lock, with stale lock takeover support.
+ *
+ * @param WC_Order $order The WooCommerce order.
+ * @param string   $transaction_id The Dintero transaction id.
+ * @return bool True if lock acquired by this process.
+ */
+function dintero_acquire_initial_confirmation_lock( $order, $transaction_id ) {
+	$order_id  = $order->get_id();
+	$lock_key  = dintero_get_initial_confirmation_lock_key();
+	$lock_data = array(
+		'timestamp'      => time(),
+		'transaction_id' => (string) $transaction_id,
+	);
+
+	$lock_payload = wp_json_encode( $lock_data );
+	if ( add_post_meta( $order_id, $lock_key, $lock_payload, true ) ) {
+		Dintero_Checkout_Logger::log( wp_json_encode( array( 'event' => 'confirmation_lock_acquired', 'order_id' => $order_id, 'transaction_id' => $transaction_id ) ) );
+		return true;
+	}
+
+	$order = wc_get_order( $order_id );
+	if ( dintero_is_initial_confirmation_done( $order, $transaction_id ) || $order->is_paid() || ! empty( $order->get_date_paid() ) ) {
+		dintero_backfill_initial_confirmation_done_if_paid( $order, $transaction_id );
+		Dintero_Checkout_Logger::log( wp_json_encode( array( 'event' => 'confirmation_lock_exists_duplicate_prevented', 'order_id' => $order_id, 'transaction_id' => $transaction_id, 'reason' => 'already_complete_or_paid' ) ) );
+		return false;
+	}
+
+	$current_lock_payload = get_post_meta( $order_id, $lock_key, true );
+	$current_lock_data    = json_decode( (string) $current_lock_payload, true );
+	$current_timestamp    = absint( $current_lock_data['timestamp'] ?? 0 );
+	$lock_age             = ( time() - $current_timestamp );
+	$lock_ttl             = max( 1, dintero_get_initial_confirmation_lock_ttl() );
+
+	$lock_is_stale = ( $current_timestamp <= 0 ) || ( $lock_age >= $lock_ttl );
+
+	if ( $lock_is_stale ) {
+		if ( update_post_meta( $order_id, $lock_key, $lock_payload, $current_lock_payload ) ) {
+			Dintero_Checkout_Logger::log( wp_json_encode( array( 'event' => 'confirmation_stale_lock_recovered', 'order_id' => $order_id, 'transaction_id' => $transaction_id, 'stale_lock_age' => $lock_age, 'stale_threshold' => $lock_ttl, 'previous_lock_payload' => $current_lock_data ) ) );
+			return true;
+		}
+
+		$order = wc_get_order( $order_id );
+		if ( dintero_is_initial_confirmation_done( $order, $transaction_id ) || $order->is_paid() || ! empty( $order->get_date_paid() ) ) {
+			dintero_backfill_initial_confirmation_done_if_paid( $order, $transaction_id );
+		}
+	}
+
+	Dintero_Checkout_Logger::log( wp_json_encode( array( 'event' => 'confirmation_lock_exists_duplicate_prevented', 'order_id' => $order_id, 'transaction_id' => $transaction_id, 'reason' => 'lock_fresh_or_takeover_failed', 'lock_age' => max( 0, $lock_age ), 'stale_threshold' => $lock_ttl, 'lock_has_timestamp' => ( $current_timestamp > 0 ) ) ) );
+	return false;
+}
+
+/**
+ * Release initial confirmation lock.
+ *
+ * @param WC_Order $order The WooCommerce order.
+ * @return void
+ */
+function dintero_release_initial_confirmation_lock( $order ) {
+	delete_post_meta( $order->get_id(), dintero_get_initial_confirmation_lock_key() );
+}
+
+/**
  * Confirms the Dintero Order.
  *
  * @param WC_Order $order The Woo order.
@@ -257,6 +406,23 @@ function dintero_process_authorized_order( $order, $settings, $transaction_id ) 
  */
 function dintero_confirm_order( $order, $transaction_id ) {
 	$order_id = $order->get_id();
+
+	if ( dintero_is_initial_confirmation_done( $order, $transaction_id ) ) {
+		Dintero_Checkout_Logger::log( wp_json_encode( array( 'event' => 'confirmation_skip_already_complete', 'order_id' => $order_id, 'transaction_id' => $transaction_id ) ) );
+		return;
+	}
+
+	dintero_backfill_initial_confirmation_done_if_paid( $order, $transaction_id );
+	if ( dintero_is_initial_confirmation_done( $order, $transaction_id ) ) {
+		Dintero_Checkout_Logger::log( wp_json_encode( array( 'event' => 'confirmation_skip_already_paid', 'order_id' => $order_id, 'transaction_id' => $transaction_id ) ) );
+		return;
+	}
+
+	if ( ! dintero_acquire_initial_confirmation_lock( $order, $transaction_id ) ) {
+		return;
+	}
+
+	$lock_owned = true;
 
 	$settings = get_option( 'woocommerce_dintero_checkout_settings' );
 
@@ -279,6 +445,9 @@ function dintero_confirm_order( $order, $transaction_id ) {
 			)
 		);
 		$order->save_meta_data();
+		if ( $lock_owned ) {
+			dintero_release_initial_confirmation_lock( $order );
+		}
 		return;
 	}
 
@@ -293,9 +462,14 @@ function dintero_confirm_order( $order, $transaction_id ) {
 		dintero_process_require_authentication( $order, $transaction_id, $settings['order_status_pending_authorization'] ?? 'manual-review' );
 	} else { // Otherwise process the authenticated order.
 		dintero_process_authorized_order( $order, $settings, $transaction_id );
+		dintero_mark_initial_confirmation_done( $order, $transaction_id );
+		Dintero_Checkout_Logger::log( wp_json_encode( array( 'event' => 'confirmation_done', 'order_id' => $order_id, 'transaction_id' => $transaction_id ) ) );
 	}
 
 	$order->save_meta_data();
+	if ( $lock_owned ) {
+		dintero_release_initial_confirmation_lock( $order );
+	}
 }
 
 /**
